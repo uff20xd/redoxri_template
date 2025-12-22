@@ -21,6 +21,7 @@ fn main() -> Result<(), RxiError> {
             "-Clink-args=-lc",
             //"--extern", &("libc".to_owned() + "=" + &libc.outpath),
         ])
+        .mute()
         .compile();
 
     let test = Mcule::new("main", "out/main")
