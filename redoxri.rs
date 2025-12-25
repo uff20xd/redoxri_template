@@ -22,6 +22,8 @@ use std::{
 pub type Cmd = Command;
 pub type RxiError = Box<dyn std::error::Error>;
 
+static mut FULL_MUTE: bool = false;
+
 #[derive(Clone, Debug)]
 pub struct Redoxri {
     settings: Vec<String>,
@@ -43,12 +45,13 @@ impl Redoxri {
 
         let mut settings = Vec::new();
         for setting in in_settings {
-            settings.push(setting.as_ref().to_string());
+            if setting.as_ref() != "" {
+                settings.push(setting.as_ref().to_string());
+            }
         }
 
         if args.len() > 1 {
-            Self::parse_args_to_settings(&args, &mut settings);
-            force_compile = true;
+            if Self::parse_args_to_settings(&args, &mut settings) {force_compile = true}
         }
 
         for setting in &settings {
@@ -74,16 +77,21 @@ impl Redoxri {
         me
     }
 
-    fn parse_args_to_settings(args: &Vec<String>, settings: &mut Vec<String>) {
+    fn parse_args_to_settings(args: &Vec<String>, settings: &mut Vec<String>) -> bool{
         let start_index = 1;
         let setting = match args[start_index].as_str() {
             "rebuild" => {"rebuild_all"},
             "self" => {"self_build"},
             "clean" => {"clean"},
             "get" => {"get_pkgs"},
+            "run" => {"run"},
             _ => {""},
         };
-        if setting != "" { settings.push("--cfg".to_owned()); settings.push(setting.to_owned()) }
+        if setting != "" { 
+            settings.push("--cfg".to_owned()); settings.push(setting.to_owned());
+            return true;
+        }
+        false
     }
 
     pub fn get_info() -> Vec<(bool, Box<Path>)> {
@@ -96,9 +104,10 @@ impl Redoxri {
         {
         }
 
-        #[cfg(clean)]
+        #[cfg(any(clean, run))]
         {
             self.mcule.mute();
+            unsafe { FULL_MUTE = true; }
             self.mcule.report_and_just_compile();
         }
 
@@ -110,9 +119,11 @@ impl Redoxri {
 
         if always_compile {
             self.mcule.mute();
+            unsafe { FULL_MUTE = true; }
             self.mcule.report_and_just_compile();
+            unsafe { FULL_MUTE = false; }
             self.mcule.unmute();
-            self.mcule.run();
+            self.mcule.required_run();
             exit(0)
         }
 
@@ -120,7 +131,7 @@ impl Redoxri {
         if !self.mcule.is_up_to_date() && !always_compile {
             println!("Detected Change!");
             println!("Recompiling build script...");
-            self.mcule.compile();
+            self.mcule.report_and_just_compile();
             if !self.mcule.is_successful() {
                 println!("Recompilation Failed!");
                 println!("Exiting...");
@@ -128,7 +139,7 @@ impl Redoxri {
             }
             println!("Recompilation Successful!");
             println!("Executing new build script...");
-            self.mcule.run();
+            self.mcule.required_run();
             exit(0);
         }
         Ok(())
@@ -152,16 +163,23 @@ impl Mcule {
     pub fn new<T, A>(name: &T, outpath: &A) -> Self 
     where T: ?Sized + AsRef<str> + Debug,
     A: ?Sized + AsRef<str> + Debug {
-        if outpath.as_ref()[0..1] == *"/" {
+
+        let mut outpath = outpath.as_ref().to_owned();
+
+        if &outpath[0..1] == "/" {
             panic!("Please dont use absolute paths as the Outpath of a generative Mcule, as it destroys compatibility!
-In Mcule: {}; with outpath: {}", name.as_ref(), outpath.as_ref());
+In Mcule: {}; with outpath: {}", name.as_ref(), outpath);
         }
 
         #[cfg(isolate)]
-        let outpath = "./out/".to_owned() + outpath.as_ref();
+        if &outpath[0..2] != "./out" {
+            outpath = "./out/".to_owned() + &outpath;
+        }
 
         #[cfg(not(isolate))]
-        let outpath = "./".to_owned() + outpath.as_ref();
+        if &outpath[0..2] != "./" {
+            outpath = "./".to_owned() + &outpath;
+        }
 
         Self::raw (
             // Name
@@ -248,6 +266,7 @@ In Mcule: {}; with outpath: {}", name.as_ref(), outpath.as_ref());
     pub fn compile(&mut self) -> Self {
         let mut need_to_compile = false;
 
+        #[cfg(not(clean))]
         let _last_change = match self.get_comp_date() {
             Ok(time_since_last_change) => {
                 for i in &self.inputs {
@@ -311,7 +330,9 @@ In Mcule: {}; with outpath: {}", name.as_ref(), outpath.as_ref());
             }
 
             if self.mute {
-                println!("Muted Compilation of: {} {}", &self.name, &self.outpath);
+                unsafe { if !FULL_MUTE {
+                    println!("Muted Compilation of: {} {}", &self.name, &self.outpath);
+                } }
                 _ = match cmd.output() {
                     Ok(out) => {
                         if let Some(excode) = out.status.code() {
@@ -345,6 +366,19 @@ In Mcule: {}; with outpath: {}", name.as_ref(), outpath.as_ref());
 
     fn report_and_just_compile(&mut self) -> Self {
         self.status_chain = self.just_compile();
+        let mut success = true;
+        for i in self.status_chain.clone() {
+            if i != 0 {
+                success = false;
+            }
+        }
+        self.success = success;
+
+        #[cfg(unmute_on_fail)]
+        if !self.is_successful() {
+            self.mute = false;
+            _ = self.just_compile();
+        }
         self.to_owned()
     }
 
@@ -366,12 +400,24 @@ In Mcule: {}; with outpath: {}", name.as_ref(), outpath.as_ref());
         self
     }
 
-    pub fn run(&self) -> Self {
+    pub fn required_run(&self) -> Self {
         let mut cmd = Command::new(self.outpath.clone());
         if self.mute {
             _ = cmd.output();
         } else {
             _ = cmd.status();
+        }
+        self.to_owned()
+    }
+
+    pub fn run(&self) -> Self {
+        if cfg!(run) {
+            let mut cmd = Command::new(self.outpath.clone());
+            if self.mute {
+                _ = cmd.output();
+            } else {
+                _ = cmd.status();
+            }
         }
         self.to_owned()
     }
@@ -441,23 +487,23 @@ pub enum RustCrateType {
     Empty,
 }
 
-pub struct RustMcule<'a> {
-    name: &'a str,
+pub struct RustMcule {
+    name: String,
     crate_type: RustCrateType,
     outpath: String,
     src: String,
     root: String,
     file: String,
-    flags: Vec<&'a str>,
+    flags: Vec<String>,
     deps: Vec<Mcule>,
     pre_steps: Vec<Vec<String>>,
     post_steps: Vec<Vec<String>>,
 }
 
-impl<'a> RustMcule<'a> {
-    pub fn new(name: &'a str, root: &str) -> Self {
+impl RustMcule {
+    pub fn new(name: &str, root: &str) -> Self {
         Self {
-            name, 
+            name: name.to_owned(), 
             crate_type: RustCrateType::Lib,
             outpath: "".to_owned(),
             src: "src".to_owned(),

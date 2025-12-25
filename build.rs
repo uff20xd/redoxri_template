@@ -2,9 +2,7 @@ mod redoxri;
 use redoxri::*;
 
 fn main() -> Result<(), RxiError> {
-    let _redoxri = Redoxri::new(&[
-        "--cfg", "mute_self",
-    ]);
+    let _redoxri = Redoxri::new(&[""]);
 
     let out = Mcule::new("output", "out/")
         .add_step(&["mkdir", "out"])
